@@ -3,12 +3,12 @@ bool return_to_init
 ---
 # Result
 bool success
-string status
+ExploreStatus status
 string message
 uint32 frontier_count_visited
 ---
 # Feedback
-string state
+ExploreStatus status
 uint32 frontier_count_discovered
 uint32 frontier_count_blacklisted
 geometry_msgs/PoseStamped current_target

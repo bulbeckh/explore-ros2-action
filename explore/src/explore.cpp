@@ -282,13 +282,14 @@ void Explore::makePlan()
         reachedGoal(result, target_position);
       };
   move_base_client_->async_send_goal(goal, send_goal_options);
-  publishFeedback("navigating_to_frontier", &target_position, frontiers.size());
+  publishFeedback(explore_lite_msgs::msg::ExploreStatus::NAVIGATING_TO_FRONTIER,
+                  &target_position, frontiers.size());
 }
 
 void Explore::returnToInitialPose()
 {
   RCLCPP_INFO(logger_, "Returning to initial pose.");
-  publishFeedback("returning_to_origin");
+  publishFeedback(explore_lite_msgs::msg::ExploreStatus::RETURNING_TO_ORIGIN);
 
   auto goal = nav2_msgs::action::NavigateToPose::Goal();
   goal.pose.pose.position = initial_pose_.position;
@@ -347,8 +348,7 @@ void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
       return;
     default:
       RCLCPP_WARN(logger_, "Unknown result code from move base nav2");
-      abortExploration("unknown_navigation_result",
-                       "Unknown result code from NavigateToPose");
+      abortExploration("Unknown result code from NavigateToPose");
       return;
   }
   makePlan();
@@ -363,14 +363,16 @@ void Explore::reachedInitialPose(const NavigationGoalHandle::WrappedResult& resu
   switch (result.code) {
     case rclcpp_action::ResultCode::SUCCEEDED:
       RCLCPP_INFO(logger_, "Successfully returned to initial pose.");
-      publishFeedback("returned_to_origin");
+      publishFeedback(
+          explore_lite_msgs::msg::ExploreStatus::RETURNED_TO_ORIGIN);
       active_exploration_ = false;
       returning_to_initial_pose_ = false;
       active_return_to_init_ = false;
       {
         auto action_result = std::make_shared<ExploreAction::Result>();
         action_result->success = true;
-        action_result->status = "completed";
+        action_result->status.status =
+            explore_lite_msgs::msg::ExploreStatus::EXPLORATION_COMPLETE;
         action_result->message =
             "Exploration complete and robot returned to origin";
         action_result->frontier_count_visited =
@@ -383,12 +385,10 @@ void Explore::reachedInitialPose(const NavigationGoalHandle::WrappedResult& resu
       cancelExploration("Return-to-origin goal canceled");
       return;
     case rclcpp_action::ResultCode::ABORTED:
-      abortExploration("return_to_origin_failed",
-                       "Failed to return to initial pose");
+      abortExploration("Failed to return to initial pose");
       return;
     default:
-      abortExploration("return_to_origin_failed",
-                       "Unknown result while returning to initial pose");
+      abortExploration("Unknown result while returning to initial pose");
       return;
   }
 }
@@ -411,7 +411,7 @@ bool Explore::captureInitialPose()
   }
 }
 
-void Explore::publishFeedback(const std::string& state,
+void Explore::publishFeedback(const std::string& status,
                               const geometry_msgs::msg::Point* target_position,
                               size_t frontier_count_discovered)
 {
@@ -420,7 +420,7 @@ void Explore::publishFeedback(const std::string& state,
   }
 
   auto feedback = std::make_shared<ExploreAction::Feedback>();
-  feedback->state = state;
+  feedback->status.status = status;
   feedback->frontier_count_discovered =
       static_cast<uint32_t>(frontier_count_discovered);
   feedback->frontier_count_blacklisted =
@@ -450,14 +450,13 @@ void Explore::startExploration(
   active_return_to_init_ = goal->return_to_init;
 
   if (active_return_to_init_ && !captureInitialPose()) {
-    abortExploration("initial_pose_unavailable",
-                     "Failed to capture initial pose for return-to-origin");
+    abortExploration("Failed to capture initial pose for return-to-origin");
     return;
   }
 
   RCLCPP_INFO(logger_, "Exploration action started.");
   exploring_timer_->reset();
-  publishFeedback("started");
+  publishFeedback(explore_lite_msgs::msg::ExploreStatus::EXPLORATION_STARTED);
   makePlan();
 }
 
@@ -475,7 +474,8 @@ void Explore::cancelExploration(const std::string& message)
   if (active_goal_handle_->is_canceling()) {
     auto result = std::make_shared<ExploreAction::Result>();
     result->success = false;
-    result->status = "canceled";
+    result->status.status =
+        explore_lite_msgs::msg::ExploreStatus::EXPLORATION_CANCELED;
     result->message = message;
     result->frontier_count_visited = static_cast<uint32_t>(visited_frontier_count_);
     active_goal_handle_->canceled(result);
@@ -484,8 +484,7 @@ void Explore::cancelExploration(const std::string& message)
   active_goal_handle_.reset();
 }
 
-void Explore::abortExploration(const std::string& status,
-                               const std::string& message)
+void Explore::abortExploration(const std::string& message)
 {
   if (!active_goal_handle_) {
     return;
@@ -499,7 +498,8 @@ void Explore::abortExploration(const std::string& status,
 
   auto result = std::make_shared<ExploreAction::Result>();
   result->success = false;
-  result->status = status;
+  result->status.status =
+      explore_lite_msgs::msg::ExploreStatus::EXPLORATION_ABORTED;
   result->message = message;
   result->frontier_count_visited = static_cast<uint32_t>(visited_frontier_count_);
   active_goal_handle_->abort(result);
@@ -522,7 +522,8 @@ void Explore::completeExploration(const std::string& message)
   active_exploration_ = false;
   auto result = std::make_shared<ExploreAction::Result>();
   result->success = true;
-  result->status = "completed";
+  result->status.status =
+      explore_lite_msgs::msg::ExploreStatus::EXPLORATION_COMPLETE;
   result->message = message;
   result->frontier_count_visited = static_cast<uint32_t>(visited_frontier_count_);
   active_goal_handle_->succeed(result);

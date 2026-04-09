@@ -1,17 +1,19 @@
 # Exploration status constants
-# EXPLORATION_STARTED: Exploration has begun (published on initialization)
-# EXPLORATION_IN_PROGRESS: Exploration resumed after pause
-# EXPLORATION_PAUSED: Exploration manually stopped via /explore/resume topic
-# EXPLORATION_COMPLETE: No frontiers remaining, exploration finished
-# RETURNING_TO_ORIGIN: Robot navigating back to initial pose (if return_to_init: true)
+# EXPLORATION_STARTED: Exploration action accepted and planning started
+# NAVIGATING_TO_FRONTIER: A new Nav2 goal has been sent to a frontier target
+# EXPLORATION_COMPLETE: Exploration finished successfully
+# RETURNING_TO_ORIGIN: Robot navigating back to initial pose
 # RETURNED_TO_ORIGIN: Robot successfully reached initial pose
+# EXPLORATION_CANCELED: Exploration was canceled by the action client
+# EXPLORATION_ABORTED: Exploration failed and the action aborted
 
 string EXPLORATION_STARTED=exploration_started
-string EXPLORATION_IN_PROGRESS=exploration_in_progress
-string EXPLORATION_PAUSED=exploration_paused
+string NAVIGATING_TO_FRONTIER=navigating_to_frontier
 string EXPLORATION_COMPLETE=exploration_complete
 string RETURNING_TO_ORIGIN=returning_to_origin
 string RETURNED_TO_ORIGIN=returned_to_origin
+string EXPLORATION_CANCELED=exploration_canceled
+string EXPLORATION_ABORTED=exploration_aborted
 
 # Current exploration status
 string status

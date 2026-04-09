@@ -90,10 +90,10 @@ private:
   void handleAccepted(const std::shared_ptr<ExploreGoalHandle> goal_handle);
   void startExploration(const std::shared_ptr<ExploreGoalHandle> goal_handle);
   void cancelExploration(const std::string& message);
-  void abortExploration(const std::string& status, const std::string& message);
+  void abortExploration(const std::string& message);
   void completeExploration(const std::string& message);
   void publishFeedback(
-      const std::string& state,
+      const std::string& status,
       const geometry_msgs::msg::Point* target_position = nullptr,
       size_t frontier_count_discovered = 0);
   bool captureInitialPose();
