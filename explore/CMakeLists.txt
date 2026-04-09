@@ -32,6 +32,7 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -47,6 +48,7 @@ find_package(explore_lite_msgs REQUIRED)
 
 set(DEPENDENCIES
   rclcpp
+  rclcpp_action
   std_msgs
   sensor_msgs
   tf2
@@ -97,6 +99,7 @@ target_link_libraries(explore PUBLIC
   ${visualization_msgs_TARGETS}
   nav2_costmap_2d::filters
   rclcpp::rclcpp
+  rclcpp_action::rclcpp_action
   tf2::tf2
   tf2_ros::tf2_ros
 )
@@ -134,6 +137,7 @@ ament_export_dependencies(
   nav2_msgs
   nav_msgs
   rclcpp
+  rclcpp_action
   std_msgs
   tf2
   tf2_ros

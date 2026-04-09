@@ -38,6 +38,7 @@
 
 #include <explore/explore.h>
 
+#include <limits>
 #include <thread>
 
 inline static bool same_point(const geometry_msgs::msg::Point& one,
@@ -59,6 +60,10 @@ Explore::Explore()
   , costmap_client_(*this, &tf_buffer_)
   , prev_distance_(0)
   , last_markers_count_(0)
+  , active_return_to_init_(false)
+  , active_exploration_(false)
+  , returning_to_initial_pose_(false)
+  , visited_frontier_count_(0)
 {
   double timeout;
   double min_frontier_size;
@@ -98,59 +103,27 @@ Explore::Explore()
                                                                      10);
   }
 
-  // Publisher for exploration status
-  rclcpp::QoS status_qos(10);
-  status_qos.transient_local();
-  status_pub_ = this->create_publisher<explore_lite_msgs::msg::ExploreStatus>("explore/status", status_qos);
-
-  // Subscription to resume or stop exploration
-  resume_subscription_ = this->create_subscription<std_msgs::msg::Bool>(
-      "explore/resume", 10,
-      std::bind(&Explore::resumeCallback, this, std::placeholders::_1));
-
   RCLCPP_INFO(logger_, "Waiting to connect to move_base nav2 server");
   move_base_client_->wait_for_action_server();
   RCLCPP_INFO(logger_, "Connected to move_base nav2 server");
 
-  if (return_to_init_) {
-    RCLCPP_INFO(logger_, "Getting initial pose of the robot");
-    geometry_msgs::msg::TransformStamped transformStamped;
-    std::string map_frame = costmap_client_.getGlobalFrameID();
-    try {
-      transformStamped = tf_buffer_.lookupTransform(
-          map_frame, robot_base_frame_, tf2::TimePointZero);
-      initial_pose_.position.x = transformStamped.transform.translation.x;
-      initial_pose_.position.y = transformStamped.transform.translation.y;
-      initial_pose_.orientation = transformStamped.transform.rotation;
-    } catch (tf2::TransformException& ex) {
-      RCLCPP_ERROR(logger_, "Couldn't find transform from %s to %s: %s",
-                   map_frame.c_str(), robot_base_frame_.c_str(), ex.what());
-      return_to_init_ = false;
-    }
-  }
-
   exploring_timer_ = this->create_wall_timer(
       std::chrono::milliseconds((uint16_t)(1000.0 / planner_frequency_)),
       [this]() { makePlan(); });
-  // Start exploration right away
-  auto status_msg = explore_lite_msgs::msg::ExploreStatus();
-  status_msg.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_STARTED;
-  status_pub_->publish(status_msg);
-  makePlan();
+  exploring_timer_->cancel();
+
+  explore_action_server_ = rclcpp_action::create_server<ExploreAction>(
+      this, "explore",
+      std::bind(&Explore::handleGoal, this, std::placeholders::_1,
+                std::placeholders::_2),
+      std::bind(&Explore::handleCancel, this, std::placeholders::_1),
+      std::bind(&Explore::handleAccepted, this, std::placeholders::_1));
 }
 
 Explore::~Explore()
 {
-  stop();
-}
-
-void Explore::resumeCallback(const std_msgs::msg::Bool::SharedPtr msg)
-{
-  if (msg->data) {
-    resume();
-  } else {
-    stop();
-  }
+  move_base_client_->async_cancel_all_goals();
+  exploring_timer_->cancel();
 }
 
 void Explore::visualizeFrontiers(
@@ -228,6 +201,11 @@ void Explore::visualizeFrontiers(
 
 void Explore::makePlan()
 {
+  if (!active_exploration_ || !active_goal_handle_ ||
+      active_goal_handle_->is_canceling() || returning_to_initial_pose_) {
+    return;
+  }
+
   // find frontiers
   auto pose = costmap_client_.getRobotPose();
   // get frontiers sorted according to cost
@@ -239,10 +217,7 @@ void Explore::makePlan()
 
   if (frontiers.empty()) {
     RCLCPP_WARN(logger_, "No frontiers found, stopping.");
-    auto status_msg = explore_lite_msgs::msg::ExploreStatus();
-    status_msg.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_COMPLETE;
-    status_pub_->publish(status_msg);
-    stop(true);
+    completeExploration("No frontiers remaining");
     return;
   }
 
@@ -259,10 +234,7 @@ void Explore::makePlan()
                        });
   if (frontier == frontiers.end()) {
     RCLCPP_WARN(logger_, "All frontiers traversed/tried out, stopping.");
-    auto status_msg = explore_lite_msgs::msg::ExploreStatus();
-    status_msg.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_COMPLETE;
-    status_pub_->publish(status_msg);
-    stop(true);
+    completeExploration("All frontiers exhausted");
     return;
   }
   geometry_msgs::msg::Point target_position = frontier->centroid;
@@ -277,17 +249,11 @@ void Explore::makePlan()
     prev_distance_ = frontier->min_distance;
   }
   // black list if we've made no progress for a long time
-  if ((this->now() - last_progress_ >
-      tf2::durationFromSec(progress_timeout_)) && !resuming_) {
+  if (this->now() - last_progress_ > tf2::durationFromSec(progress_timeout_)) {
     frontier_blacklist_.push_back(target_position);
     RCLCPP_DEBUG(logger_, "Adding current goal to black list");
     makePlan();
     return;
-  }
-
-  // ensure only first call of makePlan was set resuming to true
-  if (resuming_) {
-    resuming_ = false;
   }
 
   // we don't need to do anything if we still pursuing the same goal
@@ -316,14 +282,13 @@ void Explore::makePlan()
         reachedGoal(result, target_position);
       };
   move_base_client_->async_send_goal(goal, send_goal_options);
+  publishFeedback("navigating_to_frontier", &target_position, frontiers.size());
 }
 
 void Explore::returnToInitialPose()
 {
   RCLCPP_INFO(logger_, "Returning to initial pose.");
-  auto status_msg = explore_lite_msgs::msg::ExploreStatus();
-  status_msg.status = explore_lite_msgs::msg::ExploreStatus::RETURNING_TO_ORIGIN;
-  status_pub_->publish(status_msg);
+  publishFeedback("returning_to_origin");
 
   auto goal = nav2_msgs::action::NavigateToPose::Goal();
   goal.pose.pose.position = initial_pose_.position;
@@ -335,12 +300,7 @@ void Explore::returnToInitialPose()
       rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
   send_goal_options.result_callback =
       [this](const NavigationGoalHandle::WrappedResult& result) {
-        if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
-          auto status_msg = explore_lite_msgs::msg::ExploreStatus();
-          status_msg.status = explore_lite_msgs::msg::ExploreStatus::RETURNED_TO_ORIGIN;
-          status_pub_->publish(status_msg);
-          RCLCPP_INFO(logger_, "Successfully returned to initial pose.");
-        }
+        reachedInitialPose(result);
       };
   move_base_client_->async_send_goal(goal, send_goal_options);
 }
@@ -364,76 +324,240 @@ bool Explore::goalOnBlacklist(const geometry_msgs::msg::Point& goal)
 void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
                           const geometry_msgs::msg::Point& frontier_goal)
 {
+  if (!active_exploration_ || !active_goal_handle_) {
+    return;
+  }
+
   switch (result.code) {
     case rclcpp_action::ResultCode::SUCCEEDED:
       RCLCPP_DEBUG(logger_, "Goal was successful");
+      ++visited_frontier_count_;
       break;
     case rclcpp_action::ResultCode::ABORTED:
       RCLCPP_DEBUG(logger_, "Goal was aborted");
       frontier_blacklist_.push_back(frontier_goal);
       RCLCPP_DEBUG(logger_, "Adding current goal to black list");
-      // If it was aborted probably because we've found another frontier goal,
-      // so just return and don't make plan again
+      makePlan();
       return;
     case rclcpp_action::ResultCode::CANCELED:
       RCLCPP_DEBUG(logger_, "Goal was canceled");
-      // If goal canceled might be because exploration stopped from topic. Don't make new plan.
+      if (active_goal_handle_->is_canceling()) {
+        cancelExploration("Exploration goal canceled");
+      }
       return;
     default:
       RCLCPP_WARN(logger_, "Unknown result code from move base nav2");
-      break;
+      abortExploration("unknown_navigation_result",
+                       "Unknown result code from NavigateToPose");
+      return;
   }
-  // find new goal immediately regardless of planning frequency.
-  // execute via timer to prevent dead lock in move_base_client (this is
-  // callback for sendGoal, which is called in makePlan). the timer must live
-  // until callback is executed.
-  // oneshot_ = relative_nh_.createTimer(
-  //     ros::Duration(0, 0), [this](const ros::TimerEvent&) { makePlan(); },
-  //     true);
-
-  // Because of the 1-thread-executor nature of ros2 I think timer is not
-  // needed.
   makePlan();
 }
 
-void Explore::start()
+void Explore::reachedInitialPose(const NavigationGoalHandle::WrappedResult& result)
 {
-  RCLCPP_INFO(logger_, "Exploration started.");
-  auto status_msg = explore_lite_msgs::msg::ExploreStatus();
-  status_msg.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_STARTED;
-  status_pub_->publish(status_msg);
+  if (!active_goal_handle_) {
+    return;
+  }
+
+  switch (result.code) {
+    case rclcpp_action::ResultCode::SUCCEEDED:
+      RCLCPP_INFO(logger_, "Successfully returned to initial pose.");
+      publishFeedback("returned_to_origin");
+      active_exploration_ = false;
+      returning_to_initial_pose_ = false;
+      active_return_to_init_ = false;
+      {
+        auto action_result = std::make_shared<ExploreAction::Result>();
+        action_result->success = true;
+        action_result->status = "completed";
+        action_result->message =
+            "Exploration complete and robot returned to origin";
+        action_result->frontier_count_visited =
+            static_cast<uint32_t>(visited_frontier_count_);
+        active_goal_handle_->succeed(action_result);
+        active_goal_handle_.reset();
+      }
+      return;
+    case rclcpp_action::ResultCode::CANCELED:
+      cancelExploration("Return-to-origin goal canceled");
+      return;
+    case rclcpp_action::ResultCode::ABORTED:
+      abortExploration("return_to_origin_failed",
+                       "Failed to return to initial pose");
+      return;
+    default:
+      abortExploration("return_to_origin_failed",
+                       "Unknown result while returning to initial pose");
+      return;
+  }
 }
 
-void Explore::stop(bool finished_exploring)
+bool Explore::captureInitialPose()
 {
-  RCLCPP_INFO(logger_, "Exploration stopped.");
+  geometry_msgs::msg::TransformStamped transform_stamped;
+  std::string map_frame = costmap_client_.getGlobalFrameID();
+  try {
+    transform_stamped = tf_buffer_.lookupTransform(
+        map_frame, robot_base_frame_, tf2::TimePointZero);
+    initial_pose_.position.x = transform_stamped.transform.translation.x;
+    initial_pose_.position.y = transform_stamped.transform.translation.y;
+    initial_pose_.orientation = transform_stamped.transform.rotation;
+    return true;
+  } catch (tf2::TransformException& ex) {
+    RCLCPP_ERROR(logger_, "Couldn't find transform from %s to %s: %s",
+                 map_frame.c_str(), robot_base_frame_.c_str(), ex.what());
+    return false;
+  }
+}
 
-  // Only publish paused status if manually stopped (not finished exploring)
-  if (!finished_exploring) {
-    auto status_msg = explore_lite_msgs::msg::ExploreStatus();
-    status_msg.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_PAUSED;
-    status_pub_->publish(status_msg);
+void Explore::publishFeedback(const std::string& state,
+                              const geometry_msgs::msg::Point* target_position,
+                              size_t frontier_count_discovered)
+{
+  if (!active_goal_handle_ || !active_exploration_) {
+    return;
+  }
+
+  auto feedback = std::make_shared<ExploreAction::Feedback>();
+  feedback->state = state;
+  feedback->frontier_count_discovered =
+      static_cast<uint32_t>(frontier_count_discovered);
+  feedback->frontier_count_blacklisted =
+      static_cast<uint32_t>(frontier_blacklist_.size());
+  feedback->current_target.header.frame_id = costmap_client_.getGlobalFrameID();
+  feedback->current_target.header.stamp = this->now();
+  if (target_position != nullptr) {
+    feedback->current_target.pose.position = *target_position;
+    feedback->current_target.pose.orientation.w = 1.0;
+  }
+  active_goal_handle_->publish_feedback(feedback);
+}
+
+void Explore::startExploration(
+    const std::shared_ptr<ExploreGoalHandle> goal_handle)
+{
+  active_goal_handle_ = goal_handle;
+  active_exploration_ = true;
+  returning_to_initial_pose_ = false;
+  frontier_blacklist_.clear();
+  prev_goal_ = geometry_msgs::msg::Point();
+  prev_distance_ = std::numeric_limits<double>::infinity();
+  last_progress_ = this->now();
+  visited_frontier_count_ = 0;
+
+  const auto goal = goal_handle->get_goal();
+  active_return_to_init_ = goal->return_to_init;
+
+  if (active_return_to_init_ && !captureInitialPose()) {
+    abortExploration("initial_pose_unavailable",
+                     "Failed to capture initial pose for return-to-origin");
+    return;
+  }
+
+  RCLCPP_INFO(logger_, "Exploration action started.");
+  exploring_timer_->reset();
+  publishFeedback("started");
+  makePlan();
+}
+
+void Explore::cancelExploration(const std::string& message)
+{
+  if (!active_goal_handle_) {
+    return;
   }
 
   move_base_client_->async_cancel_all_goals();
   exploring_timer_->cancel();
+  active_exploration_ = false;
+  returning_to_initial_pose_ = false;
 
-  if (return_to_init_ && finished_exploring) {
-    returnToInitialPose();
+  if (active_goal_handle_->is_canceling()) {
+    auto result = std::make_shared<ExploreAction::Result>();
+    result->success = false;
+    result->status = "canceled";
+    result->message = message;
+    result->frontier_count_visited = static_cast<uint32_t>(visited_frontier_count_);
+    active_goal_handle_->canceled(result);
   }
+
+  active_goal_handle_.reset();
 }
 
-void Explore::resume()
+void Explore::abortExploration(const std::string& status,
+                               const std::string& message)
 {
-  resuming_ = true;
-  RCLCPP_INFO(logger_, "Exploration resuming.");
-  auto status_msg = explore_lite_msgs::msg::ExploreStatus();
-  status_msg.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_IN_PROGRESS;
-  status_pub_->publish(status_msg);
-  // Reactivate the timer
-  exploring_timer_->reset();
-  // Resume immediately
-  makePlan();
+  if (!active_goal_handle_) {
+    return;
+  }
+
+  RCLCPP_ERROR(logger_, "Exploration aborted: %s", message.c_str());
+  move_base_client_->async_cancel_all_goals();
+  exploring_timer_->cancel();
+  active_exploration_ = false;
+  returning_to_initial_pose_ = false;
+
+  auto result = std::make_shared<ExploreAction::Result>();
+  result->success = false;
+  result->status = status;
+  result->message = message;
+  result->frontier_count_visited = static_cast<uint32_t>(visited_frontier_count_);
+  active_goal_handle_->abort(result);
+  active_goal_handle_.reset();
+}
+
+void Explore::completeExploration(const std::string& message)
+{
+  if (!active_goal_handle_) {
+    return;
+  }
+
+  exploring_timer_->cancel();
+  if (active_return_to_init_) {
+    returning_to_initial_pose_ = true;
+    returnToInitialPose();
+    return;
+  }
+
+  active_exploration_ = false;
+  auto result = std::make_shared<ExploreAction::Result>();
+  result->success = true;
+  result->status = "completed";
+  result->message = message;
+  result->frontier_count_visited = static_cast<uint32_t>(visited_frontier_count_);
+  active_goal_handle_->succeed(result);
+  active_goal_handle_.reset();
+}
+
+rclcpp_action::GoalResponse Explore::handleGoal(
+    const rclcpp_action::GoalUUID&,
+    std::shared_ptr<const ExploreAction::Goal>)
+{
+  if (active_exploration_ || active_goal_handle_) {
+    RCLCPP_WARN(logger_, "Rejecting exploration goal because one is already active.");
+    return rclcpp_action::GoalResponse::REJECT;
+  }
+
+  return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+}
+
+rclcpp_action::CancelResponse Explore::handleCancel(
+    const std::shared_ptr<ExploreGoalHandle> goal_handle)
+{
+  if (active_goal_handle_ && goal_handle == active_goal_handle_) {
+    RCLCPP_INFO(logger_, "Received request to cancel exploration.");
+    move_base_client_->async_cancel_all_goals();
+    exploring_timer_->cancel();
+    return rclcpp_action::CancelResponse::ACCEPT;
+  }
+
+  return rclcpp_action::CancelResponse::REJECT;
+}
+
+void Explore::handleAccepted(
+    const std::shared_ptr<ExploreGoalHandle> goal_handle)
+{
+  startExploration(goal_handle);
 }
 
 }  // namespace explore

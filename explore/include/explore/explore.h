@@ -45,10 +45,9 @@
 
 #include <chrono>
 #include <cmath>
-#include <explore_lite_msgs/msg/explore_status.hpp>
+#include <explore_lite_msgs/action/explore.hpp>
 #include <geometry_msgs/msg/point.hpp>
 #include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/color_rgba.hpp>
 #include <string>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -77,14 +76,28 @@ public:
   Explore();
   ~Explore();
 
-  void start();
-  void stop(bool finished_exploring = false);
-  void resume();
-
   using NavigationGoalHandle =
       rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>;
+  using ExploreAction = explore_lite_msgs::action::Explore;
+  using ExploreGoalHandle = rclcpp_action::ServerGoalHandle<ExploreAction>;
 
 private:
+  rclcpp_action::GoalResponse handleGoal(
+      const rclcpp_action::GoalUUID& uuid,
+      std::shared_ptr<const ExploreAction::Goal> goal);
+  rclcpp_action::CancelResponse handleCancel(
+      const std::shared_ptr<ExploreGoalHandle> goal_handle);
+  void handleAccepted(const std::shared_ptr<ExploreGoalHandle> goal_handle);
+  void startExploration(const std::shared_ptr<ExploreGoalHandle> goal_handle);
+  void cancelExploration(const std::string& message);
+  void abortExploration(const std::string& status, const std::string& message);
+  void completeExploration(const std::string& message);
+  void publishFeedback(
+      const std::string& state,
+      const geometry_msgs::msg::Point* target_position = nullptr,
+      size_t frontier_count_discovered = 0);
+  bool captureInitialPose();
+
   /**
    * @brief  Make a global plan
    */
@@ -99,19 +112,14 @@ private:
   bool goalOnBlacklist(const geometry_msgs::msg::Point& goal);
 
   NavigationGoalHandle::SharedPtr navigation_goal_handle_;
-  // void
-  // goal_response_callback(std::shared_future<NavigationGoalHandle::SharedPtr>
-  // future);
   void reachedGoal(const NavigationGoalHandle::WrappedResult& result,
                    const geometry_msgs::msg::Point& frontier_goal);
+  void reachedInitialPose(const NavigationGoalHandle::WrappedResult& result);
 
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       marker_array_publisher_;
-
-  /**
-    * @brief Publisher for exploration status updates (see ExploreStatus.msg for status values)
-    */
-  rclcpp::Publisher<explore_lite_msgs::msg::ExploreStatus>::SharedPtr status_pub_;
+  rclcpp_action::Server<ExploreAction>::SharedPtr explore_action_server_;
+  std::shared_ptr<ExploreGoalHandle> active_goal_handle_;
 
   rclcpp::Logger logger_;
   tf2_ros::Buffer tf_buffer_;
@@ -122,10 +130,6 @@ private:
       move_base_client_;
   frontier_exploration::FrontierSearch search_;
   rclcpp::TimerBase::SharedPtr exploring_timer_;
-  // rclcpp::TimerBase::SharedPtr oneshot_;
-
-  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr resume_subscription_;
-  void resumeCallback(const std_msgs::msg::Bool::SharedPtr msg);
 
   std::vector<geometry_msgs::msg::Point> frontier_blacklist_;
   geometry_msgs::msg::Point prev_goal_;
@@ -142,8 +146,11 @@ private:
   double progress_timeout_;
   bool visualize_;
   bool return_to_init_;
+  bool active_return_to_init_;
   std::string robot_base_frame_;
-  bool resuming_ = false;
+  bool active_exploration_;
+  bool returning_to_initial_pose_;
+  size_t visited_frontier_count_;
 };
 }  // namespace explore
 
