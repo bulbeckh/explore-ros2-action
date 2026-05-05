@@ -97,6 +97,17 @@ private:
       const geometry_msgs::msg::Point* target_position = nullptr,
       size_t frontier_count_discovered = 0);
   bool captureInitialPose();
+  bool getFrontierGoal(
+      const frontier_exploration::Frontier& frontier,
+      const geometry_msgs::msg::Pose& robot_pose,
+      geometry_msgs::msg::Point& goal_point);
+  bool projectFrontierCandidateToFreeSpace(
+      const geometry_msgs::msg::Point& candidate,
+      geometry_msgs::msg::Point& goal_point);
+  bool goalTooCloseToRobot(const geometry_msgs::msg::Point& goal_point,
+                           const geometry_msgs::msg::Pose& robot_pose) const;
+  void navigationGoalResponseCallback(
+      NavigationGoalHandle::SharedPtr goal_handle);
 
   /**
    * @brief  Make a global plan
@@ -144,6 +155,8 @@ private:
   double planner_frequency_;
   double potential_scale_, orientation_scale_, gain_scale_;
   double progress_timeout_;
+  double min_goal_distance_;
+  int frontier_goal_search_radius_cells_;
   bool visualize_;
   bool return_to_init_;
   bool active_return_to_init_;

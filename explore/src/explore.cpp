@@ -38,7 +38,10 @@
 
 #include <explore/explore.h>
 
+#include <algorithm>
+#include <cmath>
 #include <limits>
+#include <queue>
 #include <thread>
 
 inline static bool same_point(const geometry_msgs::msg::Point& one,
@@ -48,6 +51,40 @@ inline static bool same_point(const geometry_msgs::msg::Point& one,
   double dy = one.y - two.y;
   double dist = sqrt(dx * dx + dy * dy);
   return dist < 0.01;
+}
+
+static std::vector<unsigned int> local_nhood8(
+    unsigned int idx, const nav2_costmap_2d::Costmap2D& costmap)
+{
+  std::vector<unsigned int> out;
+  const unsigned int size_x = costmap.getSizeInCellsX();
+  const unsigned int size_y = costmap.getSizeInCellsY();
+
+  if (idx >= size_x * size_y) {
+    return out;
+  }
+
+  const unsigned int mx = idx % size_x;
+  const unsigned int my = idx / size_x;
+
+  for (int dy = -1; dy <= 1; ++dy) {
+    for (int dx = -1; dx <= 1; ++dx) {
+      if (dx == 0 && dy == 0) {
+        continue;
+      }
+
+      const int nx = static_cast<int>(mx) + dx;
+      const int ny = static_cast<int>(my) + dy;
+      if (nx < 0 || ny < 0 || nx >= static_cast<int>(size_x) ||
+          ny >= static_cast<int>(size_y)) {
+        continue;
+      }
+      out.push_back(costmap.getIndex(static_cast<unsigned int>(nx),
+                                     static_cast<unsigned int>(ny)));
+    }
+  }
+
+  return out;
 }
 
 namespace explore
@@ -75,6 +112,8 @@ Explore::Explore()
   this->declare_parameter<float>("gain_scale", 1.0);
   this->declare_parameter<float>("min_frontier_size", 0.5);
   this->declare_parameter<bool>("return_to_init", false);
+  this->declare_parameter<float>("min_goal_distance", 0.3);
+  this->declare_parameter<int>("frontier_goal_search_radius_cells", 10);
 
   this->get_parameter("planner_frequency", planner_frequency_);
   this->get_parameter("progress_timeout", timeout);
@@ -84,6 +123,9 @@ Explore::Explore()
   this->get_parameter("gain_scale", gain_scale_);
   this->get_parameter("min_frontier_size", min_frontier_size);
   this->get_parameter("return_to_init", return_to_init_);
+  this->get_parameter("min_goal_distance", min_goal_distance_);
+  this->get_parameter("frontier_goal_search_radius_cells",
+                      frontier_goal_search_radius_cells_);
   this->get_parameter("robot_base_frame", robot_base_frame_);
 
   progress_timeout_ = timeout;
@@ -226,31 +268,38 @@ void Explore::makePlan()
     visualizeFrontiers(frontiers);
   }
 
-  // find non blacklisted frontier
-  auto frontier =
-      std::find_if_not(frontiers.begin(), frontiers.end(),
-                       [this](const frontier_exploration::Frontier& f) {
-                         return goalOnBlacklist(f.centroid);
-                       });
-  if (frontier == frontiers.end()) {
-    RCLCPP_WARN(logger_, "All frontiers traversed/tried out, stopping.");
-    completeExploration("All frontiers exhausted");
+  geometry_msgs::msg::Point target_position;
+  const frontier_exploration::Frontier* selected_frontier = nullptr;
+
+  for (const auto& frontier : frontiers) {
+    if (goalOnBlacklist(frontier.centroid)) {
+      continue;
+    }
+    if (getFrontierGoal(frontier, pose, target_position)) {
+      selected_frontier = &frontier;
+      break;
+    }
+  }
+
+  if (selected_frontier == nullptr) {
+    RCLCPP_WARN(logger_,
+                "No valid navigation target could be derived from any frontier.");
+    abortExploration("No reachable frontier goal could be derived");
     return;
   }
-  geometry_msgs::msg::Point target_position = frontier->centroid;
 
   // time out if we are not making any progress
   bool same_goal = same_point(prev_goal_, target_position);
 
   prev_goal_ = target_position;
-  if (!same_goal || prev_distance_ > frontier->min_distance) {
+  if (!same_goal || prev_distance_ > selected_frontier->min_distance) {
     // we have different goal or we made some progress
     last_progress_ = this->now();
-    prev_distance_ = frontier->min_distance;
+    prev_distance_ = selected_frontier->min_distance;
   }
   // black list if we've made no progress for a long time
   if (this->now() - last_progress_ > tf2::durationFromSec(progress_timeout_)) {
-    frontier_blacklist_.push_back(target_position);
+    frontier_blacklist_.push_back(selected_frontier->centroid);
     RCLCPP_DEBUG(logger_, "Adding current goal to black list");
     makePlan();
     return;
@@ -272,10 +321,9 @@ void Explore::makePlan()
 
   auto send_goal_options =
       rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
-  // send_goal_options.goal_response_callback =
-  // std::bind(&Explore::goal_response_callback, this, _1);
-  // send_goal_options.feedback_callback =
-  //   std::bind(&Explore::feedback_callback, this, _1, _2);
+  send_goal_options.goal_response_callback =
+      std::bind(&Explore::navigationGoalResponseCallback, this,
+                std::placeholders::_1);
   send_goal_options.result_callback =
       [this,
        target_position](const NavigationGoalHandle::WrappedResult& result) {
@@ -284,6 +332,107 @@ void Explore::makePlan()
   move_base_client_->async_send_goal(goal, send_goal_options);
   publishFeedback(explore_lite_msgs::msg::ExploreStatus::NAVIGATING_TO_FRONTIER,
                   &target_position, frontiers.size());
+}
+
+bool Explore::projectFrontierCandidateToFreeSpace(
+    const geometry_msgs::msg::Point& candidate,
+    geometry_msgs::msg::Point& goal_point)
+{
+  nav2_costmap_2d::Costmap2D* costmap = costmap_client_.getCostmap();
+  unsigned int start_mx;
+  unsigned int start_my;
+  if (!costmap->worldToMap(candidate.x, candidate.y, start_mx, start_my)) {
+    return false;
+  }
+
+  const unsigned int size_x = costmap->getSizeInCellsX();
+  const unsigned int size_y = costmap->getSizeInCellsY();
+  const unsigned char* map = costmap->getCharMap();
+
+  std::queue<unsigned int> bfs;
+  std::vector<bool> visited(size_x * size_y, false);
+  const unsigned int start_index = costmap->getIndex(start_mx, start_my);
+  bfs.push(start_index);
+  visited[start_index] = true;
+
+  while (!bfs.empty()) {
+    const unsigned int idx = bfs.front();
+    bfs.pop();
+
+    unsigned int mx;
+    unsigned int my;
+    costmap->indexToCells(idx, mx, my);
+    const int dx = std::abs(static_cast<int>(mx) - static_cast<int>(start_mx));
+    const int dy = std::abs(static_cast<int>(my) - static_cast<int>(start_my));
+    if (std::max(dx, dy) > frontier_goal_search_radius_cells_) {
+      continue;
+    }
+
+    if (map[idx] == nav2_costmap_2d::FREE_SPACE) {
+      costmap->mapToWorld(mx, my, goal_point.x, goal_point.y);
+      goal_point.z = 0.0;
+      return true;
+    }
+
+    for (unsigned int nbr : local_nhood8(idx, *costmap)) {
+      if (!visited[nbr]) {
+        visited[nbr] = true;
+        bfs.push(nbr);
+      }
+    }
+  }
+
+  return false;
+}
+
+bool Explore::goalTooCloseToRobot(
+    const geometry_msgs::msg::Point& goal_point,
+    const geometry_msgs::msg::Pose& robot_pose) const
+{
+  const double dx = goal_point.x - robot_pose.position.x;
+  const double dy = goal_point.y - robot_pose.position.y;
+  return std::hypot(dx, dy) < min_goal_distance_;
+}
+
+bool Explore::getFrontierGoal(
+    const frontier_exploration::Frontier& frontier,
+    const geometry_msgs::msg::Pose& robot_pose,
+    geometry_msgs::msg::Point& goal_point)
+{
+  std::vector<geometry_msgs::msg::Point> candidates;
+  candidates.reserve(frontier.points.size() + 2);
+  candidates.push_back(frontier.middle);
+  candidates.push_back(frontier.initial);
+
+  auto sorted_points = frontier.points;
+  std::sort(
+      sorted_points.begin(), sorted_points.end(),
+      [&robot_pose](const geometry_msgs::msg::Point& lhs,
+                    const geometry_msgs::msg::Point& rhs) {
+        const double lhs_dist = std::hypot(lhs.x - robot_pose.position.x,
+                                           lhs.y - robot_pose.position.y);
+        const double rhs_dist = std::hypot(rhs.x - robot_pose.position.x,
+                                           rhs.y - robot_pose.position.y);
+        return lhs_dist > rhs_dist;
+      });
+
+  const size_t candidate_limit = std::min<size_t>(sorted_points.size(), 10);
+  candidates.insert(candidates.end(), sorted_points.begin(),
+                    sorted_points.begin() + candidate_limit);
+
+  for (const auto& candidate : candidates) {
+    geometry_msgs::msg::Point projected_goal;
+    if (!projectFrontierCandidateToFreeSpace(candidate, projected_goal)) {
+      continue;
+    }
+    if (goalTooCloseToRobot(projected_goal, robot_pose)) {
+      continue;
+    }
+    goal_point = projected_goal;
+    return true;
+  }
+
+  return false;
 }
 
 void Explore::returnToInitialPose()
@@ -320,6 +469,16 @@ bool Explore::goalOnBlacklist(const geometry_msgs::msg::Point& goal)
       return true;
   }
   return false;
+}
+
+void Explore::navigationGoalResponseCallback(
+    NavigationGoalHandle::SharedPtr goal_handle)
+{
+  if (!goal_handle) {
+    RCLCPP_WARN(logger_, "NavigateToPose rejected exploration goal");
+  } else {
+    RCLCPP_DEBUG(logger_, "NavigateToPose accepted exploration goal");
+  }
 }
 
 void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
