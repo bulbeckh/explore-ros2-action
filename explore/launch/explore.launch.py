@@ -39,7 +39,7 @@ def generate_launch_description():
         ros_arguments=['--log-level',
                        'DEBUG',
                        '--log-level',
-                       'rcl:=INFO'
+                       'rcl:=INFO',
                        '--log-level',
                        'rcl_action:=INFO',
                        '--log-level',
